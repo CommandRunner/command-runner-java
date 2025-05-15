@@ -81,6 +81,11 @@
      
      ![image](https://github.com/user-attachments/assets/b382bff0-f217-4d3f-bc3f-dd5621d786b6)
 
+7. **Select input**
+   - This is only used if the tool or command you run prompts you to answer a question, this enables you to respond.
+     ![image](https://github.com/user-attachments/assets/92eb8b9f-f301-4d9a-a9dd-4a3f8ec0e584)
+
+
 
 ---
 
