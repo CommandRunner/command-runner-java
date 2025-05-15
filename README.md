@@ -25,13 +25,12 @@
 
 1. **Prerequisites:**
    - Burp Suite Professional or Community Edition
-   - Jython standalone JAR ([Download here](https://www.jython.org/download))
-   - Add the jython jar file to burp. Click on settings > extensions > Python enviroment > add the jython jar file.
-     
-     ![image](https://github.com/user-attachments/assets/556934aa-ccdf-4b32-bd07-cafa5bc318c9)
-
    - git clone https://github.com/CommandRunner/command-runner
-   - Go to extensions click on Add > Extension type - python > Next.
+   - git clone https://github.com/PortSwigger/burp-extensions-montoya-api
+   - cp the CommandRunnerMontoya.java file from command-runner repo into burp-extensions repo.
+   - Then run the following commands making sure the path is correct and you have javac installed. javac -cp /home/kali/burp-extensions-montoya-api/src/main/java:. CommandRunnerMontoya.java
+   - jar cf CommandRunnerMontoya.jar CommandRunnerMontoya*.class
+   - Now load burpsuite > Go to extensions > Select java > Select the jar file you just created in the burp-extensions repo. > Next
    - You should see a tab now in burpsuite that says command runner
   
      ![image](https://github.com/user-attachments/assets/e6530413-3856-4a8a-8af4-c11b69449a27)
