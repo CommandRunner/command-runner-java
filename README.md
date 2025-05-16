@@ -13,7 +13,7 @@
 
 ## Features
 
-- Execute OS commands from inside Burp Suite (Linux, macOS, Windows)
+- Execute OS commands from inside Burp Suite (Kali Linux)
 - Multiple independent command tabs
 - Manage a command playbook with save/delete functionality
 - Real-time command output display
