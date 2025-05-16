@@ -25,7 +25,7 @@
 
 1. **Prerequisites:**
    - Burp Suite Professional or Community Edition
-   - git clone https://github.com/CommandRunner/command-runner
+   - git clone https://github.com/CommandRunner/command-runner-java
    - git clone https://github.com/PortSwigger/burp-extensions-montoya-api
    - cp the CommandRunnerMontoya.java file from command-runner repo into burp-extensions repo.
    - Then run the following commands making sure the path is correct and you have javac installed. javac -cp /home/kali/burp-extensions-montoya-api/src/main/java:. CommandRunnerMontoya.java
