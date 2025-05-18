@@ -29,7 +29,7 @@
    - git clone https://github.com/PortSwigger/burp-extensions-montoya-api
    - cp the CommandRunnerMontoya.java file from command-runner repo into burp-extensions repo.
    - Then run the following commands making sure the path is correct and you have javac installed.
-   - javac -cp "C:\Users\bob\runner\burp-extensions-montoya-api\src\main\java;." CommandRunnerMontoya.java
+   - javac -cp "/home/kali/burp-extensions-montoya-api/src/main/java:." CommandRunnerMontoya.java
    - jar cf CommandRunnerMontoya.jar CommandRunnerMontoya*.class
    - Now load burpsuite > Go to extensions > Select java > Select the jar file you just created in the burp-extensions repo. > Next
    - You should see a tab now in burpsuite that says command runner
