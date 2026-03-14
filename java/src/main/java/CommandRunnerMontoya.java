@@ -260,10 +260,14 @@ public class CommandRunnerMontoya implements BurpExtension
         Thread runner = new Thread(() -> {
             try {
                 String output;
-                if (System.getProperty("os.name").toLowerCase().contains("win")) {
+                String os = System.getProperty("os.name").toLowerCase();
+                if (os.contains("win")) {
                     output = api.utilities().shellUtils().execute(opts, "cmd.exe", "/c", cmdText);
                 } else {
-                    output = api.utilities().shellUtils().execute(opts, "sh", "-c", cmdText);
+                    // Use login shell (-l) to load the user's full PATH (.zshrc/.bash_profile)
+                    // so tools like ffuf, nmap, gobuster etc. are found
+                    String shell = System.getenv("SHELL") != null ? System.getenv("SHELL") : "bash";
+                    output = api.utilities().shellUtils().execute(opts, shell, "-l", "-c", cmdText);
                 }
                 SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, output));
             } catch (Exception ex) {
