@@ -1,8 +1,5 @@
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.utilities.shell.ExecuteOptions;
-import burp.api.montoya.utilities.shell.ExitCodeBehavior;
-import burp.api.montoya.utilities.shell.StderrBehavior;
 
 import javax.swing.*;
 import javax.swing.border.*;
@@ -10,7 +7,7 @@ import javax.swing.text.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.*;
-import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.List;
 import java.util.regex.*;
@@ -29,11 +26,11 @@ public class CommandRunnerMontoya implements BurpExtension
     {
         this.api = api;
 
-        // --- UNLOAD HANDLER: Interrupt all running threads on unload ---
+        // --- UNLOAD HANDLER: Clean up all running processes on unload ---
         api.extension().registerUnloadingHandler(() -> {
             for (TabState tab : tabs.values()) {
-                if (tab.runningThread != null) {
-                    tab.runningThread.interrupt();
+                if (tab.process != null) {
+                    try { tab.process.destroy(); } catch (Exception ignored) {}
                 }
             }
         });
@@ -65,9 +62,8 @@ public class CommandRunnerMontoya implements BurpExtension
             mainPanel.add(headerPanel, BorderLayout.NORTH);
             mainPanel.add(tabbedPane, BorderLayout.CENTER);
 
-            addTab(); // create first tab
+            addTab();
 
-            // Register tab with Montoya
             api.userInterface().registerSuiteTab("Command Runner", mainPanel);
         });
     }
@@ -84,7 +80,6 @@ public class CommandRunnerMontoya implements BurpExtension
                 new TitledBorder(new LineBorder(Color.GRAY), "Command Configuration"),
                 new EmptyBorder(10, 10, 10, 10)));
 
-        // Command input
         JPanel cmdInputPanel = new JPanel(new BorderLayout());
         JLabel cmdLabel = new JLabel("Command:");
         cmdLabel.setFont(new Font("Sans-Serif", Font.PLAIN, 12));
@@ -98,7 +93,6 @@ public class CommandRunnerMontoya implements BurpExtension
         commandPanel.add(cmdInputPanel);
         commandPanel.add(Box.createRigidArea(new Dimension(0, 10)));
 
-        // Saved commands
         JPanel savedCmdPanel = new JPanel(new BorderLayout());
         savedCmdPanel.add(new JLabel("Saved Commands:"), BorderLayout.WEST);
         JComboBox<String> cmdCombo = new JComboBox<>(savedCommands.toArray(new String[0]));
@@ -122,7 +116,6 @@ public class CommandRunnerMontoya implements BurpExtension
         commandPanel.add(savedCmdPanel);
         commandPanel.add(Box.createRigidArea(new Dimension(0, 10)));
 
-        // Action buttons
         JPanel actionPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
         JButton runButton = styledButton("Run command");
         JButton cancelButton = styledButton("Cancel");
@@ -148,7 +141,15 @@ public class CommandRunnerMontoya implements BurpExtension
         outputScroll.setPreferredSize(new Dimension(100, 400));
         outputPanel.add(outputScroll, BorderLayout.CENTER);
 
-        // Split pane
+        // Interactive input field
+        JPanel inputPanel = new JPanel(new BorderLayout());
+        JTextField inputField = new JTextField();
+        inputField.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        JButton sendButton = styledButton("Send Input");
+        inputPanel.add(inputField, BorderLayout.CENTER);
+        inputPanel.add(sendButton, BorderLayout.EAST);
+        outputPanel.add(inputPanel, BorderLayout.SOUTH);
+
         JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, commandPanel, outputPanel);
         splitPane.setResizeWeight(0.3);
         splitPane.setOneTouchExpandable(true);
@@ -164,13 +165,16 @@ public class CommandRunnerMontoya implements BurpExtension
         tabState.cancelButton = cancelButton;
         tabState.closeButton = closeButton;
         tabState.outputArea = outputArea;
-        tabState.runningThread = null;
+        tabState.inputField = inputField;
+        tabState.sendButton = sendButton;
+        tabState.process = null;
         tabs.put(tabId, tabState);
 
-        // --- Button actions ---
         runButton.addActionListener(e -> runCommand(tabId));
         cancelButton.addActionListener(e -> cancelCommand(tabId));
         closeButton.addActionListener(e -> closeTab(tabId));
+        sendButton.addActionListener(e -> sendInput(tabId));
+        inputField.addActionListener(e -> sendInput(tabId));
 
         tabbedPane.addTab("Tab", panel);
         int idx = tabbedPane.indexOfComponent(panel);
@@ -252,48 +256,91 @@ public class CommandRunnerMontoya implements BurpExtension
         tab.cancelButton.setEnabled(true);
         tab.outputArea.setText("> Running: " + cmdText + "\n\n");
 
-        ExecuteOptions opts = ExecuteOptions.executeOptions()
-                .withTimeout(Duration.ZERO)
-                .withStderrBehavior(StderrBehavior.MERGE)
-                .withExitCodeBehavior(ExitCodeBehavior.ALLOW_NON_ZERO);
-
-        Thread runner = new Thread(() -> {
+        Runnable runner = () -> {
+            Process process = null;
             try {
-                String output;
+                ProcessBuilder pb;
                 String os = System.getProperty("os.name").toLowerCase();
                 if (os.contains("win")) {
-                    output = api.utilities().shellUtils().execute(opts, "cmd.exe", "/c", cmdText);
+                    pb = new ProcessBuilder("cmd.exe", "/c", cmdText);
                 } else {
-                    // Use login shell (-l) to load the user's full PATH (.zshrc/.bash_profile)
-                    // so tools like ffuf, nmap, gobuster etc. are found
+                    // Use login shell to load full PATH so all tools (ffuf, nmap, etc.) are found
                     String shell = System.getenv("SHELL") != null ? System.getenv("SHELL") : "bash";
-                    output = api.utilities().shellUtils().execute(opts, shell, "-l", "-c", cmdText);
+                    pb = new ProcessBuilder(shell, "-l", "-c", cmdText);
                 }
-                SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, output));
+                pb.redirectErrorStream(true);
+                process = pb.start();
+                tab.process = process;
+
+                InputStream in = process.getInputStream();
+                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                int b;
+                while ((b = in.read()) != -1) {
+                    buffer.write(b);
+                    if (b == '\n' || b == '\r') {
+                        String line = buffer.toString(StandardCharsets.UTF_8.name());
+                        SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, line));
+                        buffer.reset();
+                    } else {
+                        String bufStr = buffer.toString(StandardCharsets.UTF_8.name());
+                        if (bufStr.endsWith("[Y/n] ") || bufStr.endsWith("? ")) {
+                            SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, bufStr));
+                            buffer.reset();
+                        }
+                    }
+                }
+                if (buffer.size() > 0) {
+                    String line = buffer.toString(StandardCharsets.UTF_8.name());
+                    SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, line));
+                }
+                in.close();
+                process.waitFor();
+                int code = process.exitValue();
+                SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, "\nCommand exited with code: " + code + "\n"));
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, "\nError: " + ex.getMessage() + "\n"));
             } finally {
-                tab.runningThread = null;
+                tab.process = null;
                 SwingUtilities.invokeLater(() -> {
                     tab.runButton.setEnabled(true);
                     tab.cancelButton.setEnabled(false);
                 });
             }
-        });
-        tab.runningThread = runner;
-        runner.start();
+        };
+        new Thread(runner).start();
     }
 
     private void cancelCommand(String tabId) {
         TabState tab = tabs.get(tabId);
-        if (tab != null && tab.runningThread != null) {
-            tab.runningThread.interrupt();
-            tab.runningThread = null;
-            SwingUtilities.invokeLater(() -> {
+        if (tab != null && tab.process != null) {
+            try {
+                tab.process.destroy();
                 appendAnsi(tab.outputArea, "\nCommand was cancelled.\n");
+            } catch (Exception ex) {
+                appendAnsi(tab.outputArea, "\nError cancelling command: " + ex.getMessage() + "\n");
+            } finally {
+                tab.process = null;
                 tab.runButton.setEnabled(true);
                 tab.cancelButton.setEnabled(false);
-            });
+            }
+        }
+    }
+
+    private void sendInput(String tabId) {
+        TabState tab = tabs.get(tabId);
+        if (tab != null && tab.process != null) {
+            try {
+                String userInput = tab.inputField.getText();
+                OutputStream out = tab.process.getOutputStream();
+                out.write((userInput + "\n").getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                appendAnsi(tab.outputArea, "> " + userInput + "\n");
+                tab.inputField.setText("");
+            } catch (Exception ex) {
+                appendAnsi(tab.outputArea, "\nError sending input: " + ex.getMessage() + "\n");
+            }
+        } else if (tab != null) {
+            appendAnsi(tab.outputArea, "\nNo running process to send input to.\n");
         }
     }
 
@@ -316,7 +363,6 @@ public class CommandRunnerMontoya implements BurpExtension
         }
     }
 
-    // Minimal ANSI color code parser
     private List<AnsiFragment> parseAnsiFragments(String text) {
         List<AnsiFragment> fragments = new ArrayList<>();
         Matcher m = ANSI_PATTERN.matcher(text);
@@ -334,7 +380,6 @@ public class CommandRunnerMontoya implements BurpExtension
         return fragments;
     }
 
-    // Map a few common ANSI codes to Java colors
     private Color ansiToColor(String code, Color current) {
         switch (code) {
             case "\u001B[30m": return Color.BLACK;
@@ -357,7 +402,9 @@ public class CommandRunnerMontoya implements BurpExtension
         JComboBox<String> cmdCombo;
         JButton runButton, cancelButton, closeButton;
         JTextPane outputArea;
-        volatile Thread runningThread;
+        JTextField inputField;
+        JButton sendButton;
+        Process process;
     }
 
     private static class AnsiFragment {
