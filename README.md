@@ -23,16 +23,25 @@
 
 ## Installation
 
-1. **Prerequisites:**
-   - Burp Suite Professional or Community Edition
-   - git clone https://github.com/CommandRunner/command-runner-java
-   - git clone https://github.com/PortSwigger/burp-extensions-montoya-api
-   - cp the CommandRunnerMontoya.java file from command-runner repo into burp-extensions repo.
-   - Then run the following commands making sure the path is correct and you have javac installed.
-   - javac -cp "/home/kali/burp-extensions-montoya-api/src/main/java:." CommandRunnerMontoya.java
-   - jar cf CommandRunnerMontoya.jar CommandRunnerMontoya*.class
-   - Now load burpsuite > Go to extensions > Select java > Select the jar file you just created in the burp-extensions repo. > Next
-   - You should see a tab now in burpsuite that says command runner
+**Requirements:** Burp Suite Professional or Community Edition (v2025.6 or later)
+
+### Option A — Pre-built jar (easiest)
+
+1. Download `command-runner-1.0.0.jar` from this repository.
+2. Open Burp Suite → **Extensions** → **Add**
+3. Set Extension type to **Java**, select the downloaded jar → **Next**
+4. You should see a **Command Runner** tab in Burp Suite.
+
+### Option B — Build from source
+
+1. Clone the repo and make sure you have Java 17+ and Gradle installed.
+2. Run:
+   ```bash
+   cd java
+   gradle jar
+   ```
+3. The jar will be at `java/build/libs/command-runner-1.0.0.jar`
+4. Load it in Burp Suite as above.
   
      ![image](https://github.com/user-attachments/assets/e6530413-3856-4a8a-8af4-c11b69449a27)
 
@@ -81,11 +90,6 @@
    - click on the small arrows to resize 
      
      ![image](https://github.com/user-attachments/assets/b382bff0-f217-4d3f-bc3f-dd5621d786b6)
-
-7. **Select input**
-   - This is only used if the tool or command you run prompts you to answer a question, this enables you to respond.
-     ![image](https://github.com/user-attachments/assets/92eb8b9f-f301-4d9a-a9dd-4a3f8ec0e584)
-
 
 
 ---
