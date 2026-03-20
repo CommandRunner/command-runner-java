@@ -27,7 +27,7 @@
 
 ### Option A — Pre-built jar (easiest)
 
-1. Download `command-runner-1.0.0.jar` from this repository.
+1. Download `command-runner-1.0.0.jar` from this repository's "Releases".
 2. Open Burp Suite → **Extensions** → **Add**
 3. Set Extension type to **Java**, select the downloaded jar → **Next**
 4. You should see a **Command Runner** tab in Burp Suite.
@@ -37,8 +37,7 @@
 1. Clone the repo and make sure you have Java 17+ and Gradle installed.
 2. Run:
    ```bash
-   cd java
-   gradle jar
+   ./gradlew jar
    ```
 3. The jar will be at `java/build/libs/command-runner-1.0.0.jar`
 4. Load it in Burp Suite as above.
