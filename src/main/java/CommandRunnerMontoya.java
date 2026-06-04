@@ -10,29 +10,62 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.*;
+import java.util.stream.Collectors;
 
 public class CommandRunnerMontoya implements BurpExtension
 {
     private JPanel mainPanel;
     private JTabbedPane tabbedPane;
     private List<String> savedCommands = new ArrayList<>();
-    private Map<String, TabState> tabs = new HashMap<>();
-    private static final String COMMANDS_FILE = "commands.txt";
+    private final Map<String, TabState> tabs = new ConcurrentHashMap<>();
+
+    // Persist saved commands in a stable, user-owned location rather than the
+    // JVM's current working directory (which may be read-only depending on how
+    // Burp was launched).
+    private static final File COMMANDS_FILE =
+            new File(new File(System.getProperty("user.home"), ".burp-command-runner"), "commands.txt");
+
+    // Background executors keep file-system and stdin writes off the EDT.
+    private final ExecutorService fileExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "command-runner-file");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ExecutorService ioExecutor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "command-runner-io");
+        t.setDaemon(true);
+        return t;
+    });
+
     private MontoyaApi api;
+
+    // Output-pane growth bounds: trim from the top once we cross the cap so a
+    // continuously-producing command can't exhaust the heap.
+    private static final int MAX_OUTPUT_CHARS = 500_000;
+    private static final int TRIM_TO_CHARS = 400_000;
+
+    // Output batching: flush accumulated output to the EDT when it grows past
+    // this size or this many milliseconds elapse, whichever comes first.
+    private static final int BATCH_CHARS = 4096;
+    private static final long BATCH_INTERVAL_MS = 50;
 
     @Override
     public void initialize(MontoyaApi api)
     {
         this.api = api;
 
-        // --- UNLOAD HANDLER: Clean up all running processes on unload ---
+        // --- UNLOAD HANDLER: Clean up all running processes/threads on unload ---
         api.extension().registerUnloadingHandler(() -> {
             for (TabState tab : tabs.values()) {
-                if (tab.process != null) {
-                    try { tab.process.destroy(); } catch (Exception ignored) {}
-                }
+                destroyProcessTree(tab.process);
+                if (tab.executor != null) tab.executor.shutdownNow();
             }
+            fileExecutor.shutdownNow();
+            ioExecutor.shutdownNow();
         });
 
         loadCommands();
@@ -120,9 +153,11 @@ public class CommandRunnerMontoya implements BurpExtension
         JButton runButton = styledButton("Run command");
         JButton cancelButton = styledButton("Cancel");
         cancelButton.setEnabled(false);
+        JButton clearButton = styledButton("Clear Output");
         JButton closeButton = styledButton("Close Tab");
         actionPanel.add(runButton);
         actionPanel.add(cancelButton);
+        actionPanel.add(clearButton);
         actionPanel.add(closeButton);
         commandPanel.add(actionPanel);
 
@@ -168,10 +203,16 @@ public class CommandRunnerMontoya implements BurpExtension
         tabState.inputField = inputField;
         tabState.sendButton = sendButton;
         tabState.process = null;
+        tabState.executor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "command-runner-exec");
+            t.setDaemon(true);
+            return t;
+        });
         tabs.put(tabId, tabState);
 
         runButton.addActionListener(e -> runCommand(tabId));
         cancelButton.addActionListener(e -> cancelCommand(tabId));
+        clearButton.addActionListener(e -> outputArea.setText(""));
         closeButton.addActionListener(e -> closeTab(tabId));
         sendButton.addActionListener(e -> sendInput(tabId));
         inputField.addActionListener(e -> sendInput(tabId));
@@ -195,6 +236,7 @@ public class CommandRunnerMontoya implements BurpExtension
             int idx = tabbedPane.indexOfComponent(tab.panel);
             if (idx != -1) tabbedPane.remove(idx);
             cancelCommand(tabId);
+            if (tab.executor != null) tab.executor.shutdownNow();
             tabs.remove(tabId);
         }
     }
@@ -205,7 +247,7 @@ public class CommandRunnerMontoya implements BurpExtension
             savedCommands.add(cmd);
             for (TabState t : tabs.values())
                 t.cmdCombo.addItem(cmd);
-            saveCommands();
+            persistCommands();
         }
     }
 
@@ -216,13 +258,13 @@ public class CommandRunnerMontoya implements BurpExtension
             savedCommands.remove(cmd);
             for (TabState t : tabs.values())
                 t.cmdCombo.removeItem(cmd);
-            saveCommands();
+            persistCommands();
         }
     }
 
     private void loadCommands() {
         savedCommands.clear();
-        File f = new File(COMMANDS_FILE);
+        File f = COMMANDS_FILE;
         if (f.exists()) {
             try (BufferedReader r = new BufferedReader(new FileReader(f))) {
                 String line;
@@ -232,17 +274,28 @@ public class CommandRunnerMontoya implements BurpExtension
                         savedCommands.add(line);
                 }
             } catch (Exception e) {
-                System.out.println("[Command Runner] Error loading commands: " + e);
+                logError("Error loading commands: " + e);
             }
         }
     }
 
-    private void saveCommands() {
-        try (PrintWriter w = new PrintWriter(new FileWriter(COMMANDS_FILE))) {
-            for (String cmd : savedCommands)
-                w.println(cmd);
+    // Offload the disk write to a background thread so file-system latency
+    // never reaches the EDT.
+    private void persistCommands() {
+        final List<String> snapshot = new ArrayList<>(savedCommands);
+        fileExecutor.submit(() -> writeCommands(snapshot));
+    }
+
+    private void writeCommands(List<String> commands) {
+        try {
+            File parent = COMMANDS_FILE.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            try (PrintWriter w = new PrintWriter(new FileWriter(COMMANDS_FILE))) {
+                for (String cmd : commands)
+                    w.println(cmd);
+            }
         } catch (Exception e) {
-            System.out.println("[Command Runner] Error saving commands: " + e);
+            logError("Error saving commands: " + e);
         }
     }
 
@@ -264,8 +317,10 @@ public class CommandRunnerMontoya implements BurpExtension
                 if (os.contains("win")) {
                     pb = new ProcessBuilder("cmd.exe", "/c", cmdText);
                 } else {
-                    // Use login shell to load full PATH so all tools (ffuf, nmap, etc.) are found
-                    String shell = System.getenv("SHELL") != null ? System.getenv("SHELL") : "bash";
+                    // /bin/sh is guaranteed on every POSIX-compliant system, whereas
+                    // bash may be absent (Alpine containers, minimal BSD). Honour $SHELL
+                    // when set, otherwise fall back to /bin/sh rather than bash.
+                    String shell = System.getenv("SHELL") != null ? System.getenv("SHELL") : "/bin/sh";
                     pb = new ProcessBuilder(shell, "-l", "-c", cmdText);
                 }
                 pb.redirectErrorStream(true);
@@ -274,30 +329,41 @@ public class CommandRunnerMontoya implements BurpExtension
 
                 InputStream in = process.getInputStream();
                 ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                StringBuilder pending = new StringBuilder();
+                long lastFlush = System.currentTimeMillis();
                 int b;
                 while ((b = in.read()) != -1) {
                     buffer.write(b);
                     if (b == '\n' || b == '\r') {
-                        String line = buffer.toString(StandardCharsets.UTF_8.name());
-                        SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, line));
+                        pending.append(buffer.toString(StandardCharsets.UTF_8.name()));
                         buffer.reset();
                     } else {
                         String bufStr = buffer.toString(StandardCharsets.UTF_8.name());
                         if (bufStr.endsWith("[Y/n] ") || bufStr.endsWith("? ")) {
-                            SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, bufStr));
+                            // Interactive prompt: flush immediately so the user sees it.
+                            pending.append(bufStr);
                             buffer.reset();
+                            flushPending(tab, pending);
+                            lastFlush = System.currentTimeMillis();
+                            continue;
                         }
                     }
+                    long now = System.currentTimeMillis();
+                    if (pending.length() >= BATCH_CHARS
+                            || (pending.length() > 0 && now - lastFlush >= BATCH_INTERVAL_MS)) {
+                        flushPending(tab, pending);
+                        lastFlush = now;
+                    }
                 }
-                if (buffer.size() > 0) {
-                    String line = buffer.toString(StandardCharsets.UTF_8.name());
-                    SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, line));
-                }
+                if (buffer.size() > 0)
+                    pending.append(buffer.toString(StandardCharsets.UTF_8.name()));
+                flushPending(tab, pending);
                 in.close();
                 process.waitFor();
                 int code = process.exitValue();
                 SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, "\nCommand exited with code: " + code + "\n"));
             } catch (Exception ex) {
+                logError("Command execution failed: " + ex);
                 SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, "\nError: " + ex.getMessage() + "\n"));
             } finally {
                 tab.process = null;
@@ -307,16 +373,25 @@ public class CommandRunnerMontoya implements BurpExtension
                 });
             }
         };
-        new Thread(runner).start();
+        tab.executor.submit(runner);
+    }
+
+    // Flush the accumulated output buffer to the EDT as a single batch, then clear it.
+    private void flushPending(TabState tab, StringBuilder pending) {
+        if (pending.length() == 0) return;
+        final String chunk = pending.toString();
+        pending.setLength(0);
+        SwingUtilities.invokeLater(() -> appendAnsi(tab.outputArea, chunk));
     }
 
     private void cancelCommand(String tabId) {
         TabState tab = tabs.get(tabId);
         if (tab != null && tab.process != null) {
             try {
-                tab.process.destroy();
+                destroyProcessTree(tab.process);
                 appendAnsi(tab.outputArea, "\nCommand was cancelled.\n");
             } catch (Exception ex) {
+                logError("Error cancelling command: " + ex);
                 appendAnsi(tab.outputArea, "\nError cancelling command: " + ex.getMessage() + "\n");
             } finally {
                 tab.process = null;
@@ -326,26 +401,60 @@ public class CommandRunnerMontoya implements BurpExtension
         }
     }
 
+    // Forcibly terminate the process and its entire descendant tree. On Windows
+    // process.destroy() only kills the immediate child, leaving spawned subprocess
+    // trees running; descendants().destroyForcibly() cleans those up too (Java 9+).
+    private void destroyProcessTree(Process process) {
+        if (process == null) return;
+        try {
+            List<ProcessHandle> descendants = process.descendants().collect(Collectors.toList());
+            process.destroyForcibly();
+            for (ProcessHandle child : descendants) {
+                try { child.destroyForcibly(); } catch (Exception ignored) {}
+            }
+        } catch (Exception e) {
+            logError("Error destroying process tree: " + e);
+            try { process.destroyForcibly(); } catch (Exception ignored) {}
+        }
+    }
+
     private void sendInput(String tabId) {
         TabState tab = tabs.get(tabId);
-        if (tab != null && tab.process != null) {
+        if (tab == null) return;
+        final Process process = tab.process;
+        if (process == null) {
+            appendAnsi(tab.outputArea, "\nNo running process to send input to.\n");
+            return;
+        }
+        final String userInput = tab.inputField.getText();
+        tab.inputField.setText("");
+        appendAnsi(tab.outputArea, "> " + userInput + "\n");
+        // Write to the process off the EDT: if the pipe buffer fills because the
+        // process isn't consuming stdin fast enough, the write blocks until it
+        // drains, which would otherwise freeze the UI.
+        ioExecutor.submit(() -> {
             try {
-                String userInput = tab.inputField.getText();
-                OutputStream out = tab.process.getOutputStream();
+                OutputStream out = process.getOutputStream();
                 out.write((userInput + "\n").getBytes(StandardCharsets.UTF_8));
                 out.flush();
-                appendAnsi(tab.outputArea, "> " + userInput + "\n");
-                tab.inputField.setText("");
             } catch (Exception ex) {
-                appendAnsi(tab.outputArea, "\nError sending input: " + ex.getMessage() + "\n");
+                logError("Error sending input: " + ex);
+                SwingUtilities.invokeLater(() ->
+                        appendAnsi(tab.outputArea, "\nError sending input: " + ex.getMessage() + "\n"));
             }
-        } else if (tab != null) {
-            appendAnsi(tab.outputArea, "\nNo running process to send input to.\n");
+        });
+    }
+
+    private void logError(String message) {
+        try {
+            if (api != null) api.logging().logToError("[Command Runner] " + message);
+        } catch (Exception ignored) {
+            // Logging must never throw back into the caller.
         }
     }
 
     // --- ANSI color parsing and output ---
-    private static final Pattern ANSI_PATTERN = Pattern.compile("(\u001B\\[[;\\d]*m)");
+    private static final Pattern ANSI_PATTERN = Pattern.compile("(\\[[;\\d]*m)");
 
     private void appendAnsi(JTextPane pane, String text) {
         StyledDocument doc = pane.getStyledDocument();
@@ -357,9 +466,15 @@ public class CommandRunnerMontoya implements BurpExtension
                     StyleConstants.setForeground(attrs, frag.color);
                 doc.insertString(doc.getLength(), frag.text, attrs);
             }
+            // Roll off the oldest output once we exceed the cap so continuously
+            // producing commands can't grow the document until the heap is exhausted.
+            int len = doc.getLength();
+            if (len > MAX_OUTPUT_CHARS) {
+                doc.remove(0, len - TRIM_TO_CHARS);
+            }
             pane.setCaretPosition(doc.getLength());
         } catch (BadLocationException e) {
-            e.printStackTrace();
+            logError("Error appending output: " + e);
         }
     }
 
@@ -382,15 +497,15 @@ public class CommandRunnerMontoya implements BurpExtension
 
     private Color ansiToColor(String code, Color current) {
         switch (code) {
-            case "\u001B[30m": return Color.BLACK;
-            case "\u001B[31m": return Color.RED;
-            case "\u001B[32m": return new Color(0, 128, 0);
-            case "\u001B[33m": return Color.ORANGE;
-            case "\u001B[34m": return Color.BLUE;
-            case "\u001B[35m": return new Color(128, 0, 128);
-            case "\u001B[36m": return Color.CYAN;
-            case "\u001B[37m": return Color.LIGHT_GRAY;
-            case "\u001B[0m":  return null;
+            case "[30m": return Color.BLACK;
+            case "[31m": return Color.RED;
+            case "[32m": return new Color(0, 128, 0);
+            case "[33m": return Color.ORANGE;
+            case "[34m": return Color.BLUE;
+            case "[35m": return new Color(128, 0, 128);
+            case "[36m": return Color.CYAN;
+            case "[37m": return Color.LIGHT_GRAY;
+            case "[0m":  return null;
             default: return current;
         }
     }
@@ -404,7 +519,11 @@ public class CommandRunnerMontoya implements BurpExtension
         JTextPane outputArea;
         JTextField inputField;
         JButton sendButton;
-        Process process;
+        // Written by the worker thread, read by the EDT (cancel / send-input):
+        // volatile guarantees visibility across threads.
+        volatile Process process;
+        // Per-tab lifecycle: runs the command and is shut down on close/unload.
+        ExecutorService executor;
     }
 
     private static class AnsiFragment {
